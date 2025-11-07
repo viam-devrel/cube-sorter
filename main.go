@@ -215,6 +215,12 @@ func main() {
 	// Confirmation before approaching the object
 	if !waitForConfirmation("Proceed to lower to object?") {
 		logger.Info("Operation cancelled by user")
+		logger.Info("Going to home position")
+		err = homePose.SetPosition(context.Background(), 2, nil)
+		if err != nil {
+			logger.Error(err)
+			return
+		}
 		return
 	}
 
@@ -237,6 +243,12 @@ func main() {
 	// Confirmation before grabbing the object
 	if !waitForConfirmation("Proceed to grab object with gripper?") {
 		logger.Info("Grab operation cancelled by user")
+		logger.Info("Going to home position")
+		err = homePose.SetPosition(context.Background(), 2, nil)
+		if err != nil {
+			logger.Error(err)
+			return
+		}
 		return
 	}
 
@@ -285,45 +297,4 @@ func main() {
 		logger.Error(err)
 		return
 	}
-
-	// md := objs[0].MetaData()
-
-	// logger.Info("Selected object metadata: %v", md)
-
-	// pickupSpot := md.Center()
-	// // pickupSpot.Z = md.MaxZ
-
-	// logger.Info("Initial pickup spot pose", pickupSpot)
-
-	// pickupSpot = GetApproachPoint(pickupSpot, 0, &spatialmath.OrientationVectorDegrees{OZ: -1})
-
-	// logger.Info("Approach pickup spot pose", pickupSpot)
-
-	// currentPose, err := motionService.GetPose(context.Background(), lite6.Name().Name, "world", nil, nil)
-	// if err != nil {
-	// 	logger.Error(err)
-	// 	return
-	// }
-
-	// goalPose := referenceframe.NewPoseInFrame("world", spatialmath.NewPose(pickupSpot, &spatialmath.OrientationVectorDegrees{OZ: -1, Theta: currentPose.Pose().Orientation().OrientationVectorDegrees().Theta}))
-
-	// logger.Info("Want to go to: ", goalPose)
-
-	// err = vacuumGripper.Open(context.Background(), nil)
-	// if err != nil {
-	// 	logger.Error(err)
-	// 	return
-	// }
-
-	// _, err = motionService.Move(context.Background(),
-	// 	motion.MoveReq{ComponentName: lite6.Name().Name,
-	// 		Destination: goalPose,
-	// 	},
-	// )
-
-	// if err != nil {
-	// 	logger.Error(err)
-	// 	return
-	// }
-
 }
