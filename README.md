@@ -19,7 +19,74 @@ A pick and place demo built on the Viam platform using computer vision and motio
   - Vacuum gripper
   - Vision segmentation service configured
 
-## Setup
+## Model devrel:cube-sorter:cube-sorter
+
+The business logic service for sorting cubes into bowls, or other arbitrary pick and place tasks.
+
+### Configuration
+The following attribute template can be used to configure this model:
+
+```json
+{
+    "arm_name": <string>,
+    "camera_name": <string>,
+    "gripper_name": <string>,
+    "segmenter_name": <string>,
+    "start_pose": <string>,
+    "place_pose": <string>,
+}
+```
+
+#### Attributes
+
+The following attributes are available for this model:
+
+| Name          | Type   | Inclusion | Description                |
+|---------------|--------|-----------|----------------------------|
+| `arm_name` | string  | Required  | Name of the arm component to use in motion planning. |
+| `camera_name` | string | Required  | Name of the camera component providing point cloud data. |
+| `gripper_name` | string | Required  | Name of the gripper component to use in picking. |
+| `segementer_name` | string | Required  | Name of the vision service providing point cloud objects. |
+| `start_pose` | string | Required  | Name of the `arm-position-saver` switch component providing the start position of the arm. |
+| `place_pose` | string | Required  | Name of the `arm-position-saver` switch component providing the placement position for the picked cube. |
+| `motion` | string | Optional  | Name of the motion service to use for planning. Defaults to `"builtin"` |
+
+#### Example Configuration
+
+```json
+{
+  "camera_name": "realsense-cam",
+  "gripper_name": "vacuum_gripper",
+  "segmenter_name": "segment-detections",
+  "start_pose": "home-pose",
+  "place_pose": "black-cube-placement",
+  "arm_name": "lite6-arm"
+}
+```
+
+### DoCommand
+
+#### Start
+
+Run through the pick and place routine: detect objects -> get pose for first object -> pick up object -> place in configured pose -> return to start pose
+
+```json
+{
+  "command": "start"
+}
+```
+
+#### Reset
+
+Stop any current action, open the gripper, and return to start position.
+
+```json
+{
+  "command": "reset"
+}
+```
+
+## Development
 
 ### 1. Clone the Repository
 
@@ -34,43 +101,8 @@ cd cube-sorter
 go mod tidy
 ```
 
-### 3. Configure Environment Variables
+See the [Developer Guide](./DEVELOPER_GUIDE.md) for more information about building and running the module.
 
-Create a `.env` file in the project root with your Viam robot credentials:
-
-```bash
-VIAM_ROBOT_ADDRESS=your-robot-address.viam.cloud
-VIAM_ENTITY_ID=your-entity-id
-VIAM_API_KEY=your-api-key
-```
-
-You can find these credentials in your Viam robot's settings page.
-
-**Note:** The `.env` file is ignored by git to keep your credentials secure.
-
-Alternatively, you can set these as system environment variables:
-
-```bash
-export VIAM_ROBOT_ADDRESS=your-robot-address.viam.cloud
-export VIAM_ENTITY_ID=your-entity-id
-export VIAM_API_KEY=your-api-key
-```
-
-### 4. Build and Run
-
-```bash
-# Build the application
-go build
-
-# Run the application
-./cube-sorter
-```
-
-Or run directly without building:
-
-```bash
-go run .
-```
 
 ## How It Works
 
@@ -83,44 +115,12 @@ go run .
 7. **Place**: Lifts the object and moves to a predefined drop location
 8. **Return Home**: Returns the arm to the home position
 
-The application includes user confirmation prompts at critical steps for safety.
-
-## Project Structure
-
-- `main.go` - Main application logic and robot control flow
-- `utils.go` - Utility functions for environment loading and geometric calculations
-- `.env` - Environment variables (not tracked in git)
-
-## Development
-
-### Run Tests
-
-```bash
-go test ./...
-```
-
-### Update Dependencies
-
-```bash
-go mod tidy
-```
-
-## Configuration
-
-The application uses several hardcoded parameters that can be adjusted in `main.go`:
-
-- **Z-axis heights**: 150mm (approach), 90mm (pickup), 200mm (lift)
-- **Motion constraints**: 5mm linear tolerance, 1° orientation tolerance
-- **End effector orientation**: OZ=-1, Theta=-180 (pointing downward)
-- **Timing delays**: 500ms-3000ms between operations
 
 ## Safety Notes
 
-- The application picks the first detected object only
-- User confirmation is required before critical operations
 - Ensure the workspace is clear before running
 - Emergency stop should be readily accessible on the physical robot
 
 ## License
 
-TBD
+[Apache 2.0](./LICENSE)

@@ -1,0 +1,30 @@
+{
+  "$schema": "https://dl.viam.dev/module.schema.json",
+  "module_id": "devrel:cube-sorter",
+  "visibility": "public",
+  "url": "https://github.com/viam-devrel/cube-sorter",
+  "description": "The business logic service for sorting cubes into bowls",
+  "models": [
+    {
+      "api": "rdk:service:generic",
+      "model": "devrel:cube-sorter:cube-sorter",
+      "short_description": "The business logic service for sorting cubes into bowls",
+      "markdown_link": "README.md#model-devrelcube-sortercube-sorter"
+    }
+  ],
+  "applications": null,
+  "markdown_link": "README.md",
+  "entrypoint": "bin/cube-sorter",
+  "first_run": "",
+  "build": {
+    "build": "make module.tar.gz",
+    "setup": "make setup",
+    "path": "module.tar.gz",
+    "arch": [
+      "linux/amd64",
+      "linux/arm64",
+      "darwin/arm64",
+      "windows/amd64"
+    ]
+  }
+}
