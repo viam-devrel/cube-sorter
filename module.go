@@ -3,6 +3,8 @@ package cube_sorter
 import (
 	"context"
 	"fmt"
+	"image"
+	"sync"
 	"time"
 
 	"go.viam.com/rdk/components/arm"
@@ -19,6 +21,7 @@ import (
 	"go.viam.com/rdk/services/motion"
 	"go.viam.com/rdk/services/vision"
 	"go.viam.com/rdk/spatialmath"
+	viz "go.viam.com/rdk/vision"
 
 	"github.com/erh/vmodutils"
 )
@@ -31,6 +34,11 @@ var constraints = motionplan.Constraints{
 			OrientationToleranceDegs: 1,
 		},
 	},
+}
+
+type DetectedObject struct {
+	Label string
+	Box   image.Rectangle
 }
 
 func init() {
@@ -79,6 +87,7 @@ type sorter struct {
 	cancelCtx  context.Context
 	cancelFunc func()
 
+	// service deps
 	arm       arm.Arm
 	cam       camera.Camera
 	gripper   gripper.Gripper
@@ -87,6 +96,11 @@ type sorter struct {
 	placePose toggleswitch.Switch
 	motion    motion.Service
 	client    robot.Robot
+
+	// state
+	status          string
+	detectedObjects []*viz.Object
+	mu              sync.RWMutex
 }
 
 func newSorter(ctx context.Context, deps resource.Dependencies, rawConf resource.Config, logger logging.Logger) (resource.Resource, error) {
@@ -161,6 +175,8 @@ func NewSorter(ctx context.Context, deps resource.Dependencies, name resource.Na
 		motion:    motionSvc,
 		startPose: startPose,
 		placePose: placePose,
+
+		status: "idle",
 	}
 	return s, nil
 }
@@ -178,12 +194,58 @@ func (s *sorter) DoCommand(ctx context.Context, cmd map[string]interface{}) (map
 	case "reset":
 		err := s.Reset()
 		return map[string]any{"success": err == nil}, err
+
+	case "get_detected_objects":
+		err := s.GetDetectedObjects(ctx)
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		serializedObjs := []DetectedObject{}
+		for _, obj := range s.detectedObjects {
+			serializedObjs = append(serializedObjs, DetectedObject{Label: obj.Geometry.Label(), Box: image.Rect(0, 0, 0, 0)})
+		}
+		return map[string]any{"success": err == nil, "objects": serializedObjs}, err
+
+	case "pick_object":
+		selectedObjectLabel, ok := cmd["label"].(string)
+		if !ok {
+			return nil, fmt.Errorf("pick_object command requires 'label' string parameter")
+		}
+		err := s.PickObject(ctx, selectedObjectLabel)
+		return map[string]any{"success": err == nil}, err
+
+	case "get_status":
+		status, err := s.Status()
+		return map[string]any{"success": err == nil, "status": status}, err
 	}
+
 	return nil, fmt.Errorf("unknown command: %v", cmd)
 }
 
 func (s *sorter) Start() error {
 	ctx := s.cancelCtx
+
+	err := s.GetDetectedObjects(ctx)
+	if err != nil {
+		return err
+	}
+
+	for _, obj := range s.detectedObjects {
+		err = s.PickObject(ctx, obj.Geometry.Label())
+		if err != nil {
+			return err
+		}
+	}
+
+	s.mu.Lock()
+	clear(s.detectedObjects)
+	s.mu.Unlock()
+
+	return nil
+}
+
+func (s *sorter) GetDetectedObjects(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	s.logger.Info("Going to start position")
 	err := s.startPose.SetPosition(ctx, 2, nil)
@@ -203,10 +265,28 @@ func (s *sorter) Start() error {
 		return fmt.Errorf("No objects found to sort")
 	}
 
-	waypoints := []any{}
+	s.detectedObjects = objs
+	s.status = "objects_detected"
 
-	obj := objs[0]
-	objVec := obj.Geometry.Pose().Point()
+	return nil
+}
+
+func (s *sorter) PickObject(ctx context.Context, selectedObjectLabel string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var selectedObj *viz.Object
+	for _, obj := range s.detectedObjects {
+		if obj.Geometry.Label() == selectedObjectLabel {
+			selectedObj = obj
+			break
+		}
+	}
+	if selectedObj == nil {
+		return fmt.Errorf("Unable to find matching object with label %s", selectedObjectLabel)
+	}
+
+	objVec := selectedObj.Geometry.Pose().Point()
 	s.logger.Info("Detected object at point: ", objVec)
 
 	objInCamFrame := spatialmath.NewPoseFromPoint(objVec)
@@ -232,8 +312,6 @@ func (s *sorter) Start() error {
 		referenceframe.FrameSystemInputs{},
 	)
 
-	waypoints = append(waypoints, plan.Serialize())
-
 	err = s.gripper.Open(ctx, nil)
 	if err != nil {
 		return err
@@ -243,12 +321,14 @@ func (s *sorter) Start() error {
 	worldFramePoint.Z = 90
 	goToPose = referenceframe.NewPoseInFrame("world", spatialmath.NewPose(worldFramePoint, &spatialmath.OrientationVectorDegrees{OZ: -1, Theta: -180}))
 
+	s.status = "picking"
+
 	_, err = s.motion.Move(context.Background(), motion.MoveReq{
 		ComponentName: s.arm.Name().ShortName(),
 		Destination:   goToPose,
 		Constraints:   &constraints,
 		Extra: map[string]any{
-			"waypoints": waypoints,
+			"waypoints": []any{plan.Serialize()},
 		},
 	})
 
@@ -269,13 +349,12 @@ func (s *sorter) Start() error {
 	worldFramePoint.Z = 200
 	goToPose = referenceframe.NewPoseInFrame("world", spatialmath.NewPose(worldFramePoint, &spatialmath.OrientationVectorDegrees{OZ: -1, Theta: -180}))
 
+	s.status = "placing"
+
 	_, err = s.motion.Move(context.Background(), motion.MoveReq{
 		ComponentName: s.arm.Name().ShortName(),
 		Destination:   goToPose,
 		Constraints:   &constraints,
-		Extra: map[string]any{
-			"waypoints": waypoints,
-		},
 	})
 
 	if err != nil {
@@ -303,10 +382,22 @@ func (s *sorter) Start() error {
 		return err
 	}
 
+	s.status = "idle"
+
 	return nil
 }
 
+func (s *sorter) Status() (string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.status, nil
+}
+
 func (s *sorter) Reset() error {
+	s.mu.Lock()
+	s.status = "resetting"
+	s.mu.Unlock()
+
 	ctx := s.cancelCtx
 
 	s.logger.Info("Stopping arm")
@@ -326,6 +417,11 @@ func (s *sorter) Reset() error {
 	if err != nil {
 		return err
 	}
+
+	s.mu.Lock()
+	s.status = "idle"
+	clear(s.detectedObjects)
+	s.mu.Unlock()
 
 	return nil
 }
