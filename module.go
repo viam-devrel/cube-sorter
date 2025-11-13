@@ -3,9 +3,10 @@ package cube_sorter
 import (
 	"context"
 	"fmt"
-	"image"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 
 	"go.viam.com/rdk/components/arm"
 	"go.viam.com/rdk/components/camera"
@@ -22,6 +23,7 @@ import (
 	"go.viam.com/rdk/services/vision"
 	"go.viam.com/rdk/spatialmath"
 	viz "go.viam.com/rdk/vision"
+	"go.viam.com/rdk/vision/objectdetection"
 
 	"github.com/erh/vmodutils"
 )
@@ -34,11 +36,6 @@ var constraints = motionplan.Constraints{
 			OrientationToleranceDegs: 1,
 		},
 	},
-}
-
-type DetectedObject struct {
-	Label string
-	Box   image.Rectangle
 }
 
 func init() {
@@ -55,8 +52,8 @@ type Config struct {
 	Gripper   string `json:"gripper_name"`
 	Segmenter string `json:"segmenter_name"`
 
-	StartPose string `json:"start_pose"`
-	PlacePose string `json:"place_pose"`
+	StartPose string            `json:"start_pose"`
+	Placement map[string]string `json:"placement"`
 
 	Motion string `json:"motion_service,omitempty"`
 }
@@ -66,12 +63,16 @@ type Config struct {
 // The path is the JSON path in your robot's config (not the `Config` struct) to the
 // resource being validated; e.g. "components.0".
 func (cfg *Config) Validate(path string) ([]string, []string, error) {
-	deps := []string{cfg.Arm, cfg.Cam, cfg.Gripper, cfg.Segmenter, cfg.StartPose, cfg.PlacePose}
+	deps := []string{cfg.Arm, cfg.Cam, cfg.Gripper, cfg.Segmenter, cfg.StartPose}
 
 	if cfg.Motion == "" {
 		cfg.Motion = motion.Named("builtin").String()
 	}
 	deps = append(deps, cfg.Motion)
+
+	for _, pose := range cfg.Placement {
+		deps = append(deps, pose)
+	}
 
 	return deps, nil, nil
 }
@@ -88,18 +89,18 @@ type sorter struct {
 	cancelFunc func()
 
 	// service deps
-	arm       arm.Arm
-	cam       camera.Camera
-	gripper   gripper.Gripper
-	segmenter vision.Service
-	startPose toggleswitch.Switch
-	placePose toggleswitch.Switch
-	motion    motion.Service
-	client    robot.Robot
+	arm        arm.Arm
+	cam        camera.Camera
+	gripper    gripper.Gripper
+	segmenter  vision.Service
+	startPose  toggleswitch.Switch
+	placePoses map[string]toggleswitch.Switch
+	motion     motion.Service
+	client     robot.Robot
 
 	// state
 	status          string
-	detectedObjects []*viz.Object
+	detectedObjects []DetectedObject
 	mu              sync.RWMutex
 }
 
@@ -123,6 +124,8 @@ func NewSorter(ctx context.Context, deps resource.Dependencies, name resource.Na
 		return nil, err
 	}
 
+	logger.Info("Following placement poses: ", conf.Placement)
+
 	armDep, err := arm.FromProvider(deps, conf.Arm)
 	if err != nil {
 		return nil, err
@@ -143,9 +146,13 @@ func NewSorter(ctx context.Context, deps resource.Dependencies, name resource.Na
 		return nil, err
 	}
 
-	placePose, err := toggleswitch.FromProvider(deps, conf.PlacePose)
-	if err != nil {
-		return nil, err
+	placePoses := map[string]toggleswitch.Switch{}
+	for key, pose := range conf.Placement {
+		poseSwitch, err := toggleswitch.FromProvider(deps, pose)
+		if err != nil {
+			return nil, err
+		}
+		placePoses[key] = poseSwitch
 	}
 
 	segmenter, err := vision.FromProvider(deps, conf.Segmenter)
@@ -167,14 +174,14 @@ func NewSorter(ctx context.Context, deps resource.Dependencies, name resource.Na
 		cancelCtx:  cancelCtx,
 		cancelFunc: cancelFunc,
 
-		client:    robotClient,
-		arm:       armDep,
-		cam:       cam,
-		gripper:   gripperDep,
-		segmenter: segmenter,
-		motion:    motionSvc,
-		startPose: startPose,
-		placePose: placePose,
+		client:     robotClient,
+		arm:        armDep,
+		cam:        cam,
+		gripper:    gripperDep,
+		segmenter:  segmenter,
+		motion:     motionSvc,
+		startPose:  startPose,
+		placePoses: placePoses,
 
 		status: "idle",
 	}
@@ -199,9 +206,9 @@ func (s *sorter) DoCommand(ctx context.Context, cmd map[string]interface{}) (map
 		err := s.GetDetectedObjects(ctx)
 		s.mu.RLock()
 		defer s.mu.RUnlock()
-		serializedObjs := []DetectedObject{}
+		serializedObjs := []any{}
 		for _, obj := range s.detectedObjects {
-			serializedObjs = append(serializedObjs, DetectedObject{Label: obj.Geometry.Label(), Box: image.Rect(0, 0, 0, 0)})
+			serializedObjs = append(serializedObjs, obj.Serialize())
 		}
 		return map[string]any{"success": err == nil, "objects": serializedObjs}, err
 
@@ -230,7 +237,7 @@ func (s *sorter) Start() error {
 	}
 
 	for _, obj := range s.detectedObjects {
-		err = s.PickObject(ctx, obj.Geometry.Label())
+		err = s.PickObject(ctx, obj.Label)
 		if err != nil {
 			return err
 		}
@@ -255,17 +262,49 @@ func (s *sorter) GetDetectedObjects(ctx context.Context) error {
 
 	time.Sleep(time.Millisecond * 500)
 
+	g, ctx := errgroup.WithContext(ctx)
+	results := map[string]any{}
+
 	s.logger.Info("Getting objects from camera")
-	objs, err := s.segmenter.GetObjectPointClouds(ctx, "", nil)
-	if err != nil {
+
+	g.Go(func() error {
+		objs, err := s.segmenter.GetObjectPointClouds(ctx, "", nil)
+		if err != nil {
+			return err
+		}
+		results["objects"] = objs
+		return nil
+	})
+
+	g.Go(func() error {
+		dets, err := s.segmenter.DetectionsFromCamera(ctx, "", nil)
+		if err != nil {
+			return err
+		}
+		results["detections"] = dets
+		return nil
+	})
+
+	if err = g.Wait(); err != nil {
 		return err
 	}
 
+	objs := results["objects"].([]*viz.Object)
 	if len(objs) == 0 {
 		return fmt.Errorf("No objects found to sort")
 	}
 
-	s.detectedObjects = objs
+	dets := results["detections"].([]objectdetection.Detection)
+
+	for _, obj := range objs {
+		label := obj.Geometry.Label()
+		for _, det := range dets {
+			if det.Label() == label {
+				s.detectedObjects = append(s.detectedObjects, DetectedObject{Label: label, Object: *obj, Detection: det})
+				break
+			}
+		}
+	}
 	s.status = "objects_detected"
 
 	return nil
@@ -277,14 +316,16 @@ func (s *sorter) PickObject(ctx context.Context, selectedObjectLabel string) err
 
 	var selectedObj *viz.Object
 	for _, obj := range s.detectedObjects {
-		if obj.Geometry.Label() == selectedObjectLabel {
-			selectedObj = obj
+		if obj.Label == selectedObjectLabel {
+			selectedObj = &obj.Object
 			break
 		}
 	}
 	if selectedObj == nil {
 		return fmt.Errorf("Unable to find matching object with label %s", selectedObjectLabel)
 	}
+
+	objLabel := selectedObj.Geometry.Label()
 
 	objVec := selectedObj.Geometry.Pose().Point()
 	s.logger.Info("Detected object at point: ", objVec)
@@ -361,8 +402,12 @@ func (s *sorter) PickObject(ctx context.Context, selectedObjectLabel string) err
 		return err
 	}
 
-	s.logger.Info("Going to place position")
-	err = s.placePose.SetPosition(ctx, 2, nil)
+	placePose, ok := s.placePoses[objLabel]
+	if !ok {
+		return fmt.Errorf("Unable to find pose to place %s", objLabel)
+	}
+	s.logger.Infof("Going to place position for %s", objLabel)
+	err = placePose.SetPosition(ctx, 2, nil)
 	if err != nil {
 		return err
 	}

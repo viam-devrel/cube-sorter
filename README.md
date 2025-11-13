@@ -33,7 +33,7 @@ The following attribute template can be used to configure this model:
     "gripper_name": <string>,
     "segmenter_name": <string>,
     "start_pose": <string>,
-    "place_pose": <string>,
+    "placement": <map[string]string>,
 }
 ```
 
@@ -48,19 +48,24 @@ The following attributes are available for this model:
 | `gripper_name` | string | Required  | Name of the gripper component to use in picking. |
 | `segementer_name` | string | Required  | Name of the vision service providing point cloud objects. |
 | `start_pose` | string | Required  | Name of the `arm-position-saver` switch component providing the start position of the arm. |
-| `place_pose` | string | Required  | Name of the `arm-position-saver` switch component providing the placement position for the picked cube. |
+| `placement` | map[string]string | Required  | Map of object detection labels as keys and name of the `arm-position-saver` switch component providing the placement position for the picked cube as values. |
 | `motion` | string | Optional  | Name of the motion service to use for planning. Defaults to `"builtin"` |
 
 #### Example Configuration
 
 ```json
 {
+  "arm_name": "lite6-arm",
   "camera_name": "realsense-cam",
   "gripper_name": "vacuum_gripper",
   "segmenter_name": "segment-detections",
   "start_pose": "home-pose",
-  "place_pose": "black-cube-placement",
-  "arm_name": "lite6-arm"
+  "placement": {
+    "red_cube": "red-bin-pose",
+    "yellow_cube": "yellow-bin-pose",
+    "green_cube": "green-bin-pose",
+    "blue_cube": "blue-bin-pose"
+  }
 }
 ```
 
