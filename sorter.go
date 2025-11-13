@@ -3,6 +3,7 @@ package cube_sorter
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -38,6 +39,8 @@ var constraints = motionplan.Constraints{
 	},
 }
 
+const PICK_HEIGHT = 90
+
 func init() {
 	resource.RegisterService(generic.API, Sorter,
 		resource.Registration[resource.Resource, *Config]{
@@ -56,6 +59,9 @@ type Config struct {
 	Placement map[string]string `json:"placement"`
 
 	Motion string `json:"motion_service,omitempty"`
+
+	GripperLength float64 `json:"gripper_length,omitempty"`
+	CubeHeight    float64 `json:"cube_height,omitempty"`
 }
 
 // Validate ensures all parts of the config are valid and important fields exist.
@@ -88,6 +94,10 @@ type sorter struct {
 	cancelCtx  context.Context
 	cancelFunc func()
 
+	// config
+	gripperLength float64
+	cubeHeight    float64
+
 	// service deps
 	arm        arm.Arm
 	cam        camera.Camera
@@ -112,6 +122,13 @@ func newSorter(ctx context.Context, deps resource.Dependencies, rawConf resource
 
 	if conf.Motion == "" {
 		conf.Motion = "builtin"
+	}
+
+	if conf.GripperLength == 0.0 {
+		conf.GripperLength = 60.0
+	}
+	if conf.CubeHeight == 0.0 {
+		conf.CubeHeight = 30.0
 	}
 
 	return NewSorter(ctx, deps, rawConf.ResourceName(), conf, logger)
@@ -174,14 +191,16 @@ func NewSorter(ctx context.Context, deps resource.Dependencies, name resource.Na
 		cancelCtx:  cancelCtx,
 		cancelFunc: cancelFunc,
 
-		client:     robotClient,
-		arm:        armDep,
-		cam:        cam,
-		gripper:    gripperDep,
-		segmenter:  segmenter,
-		motion:     motionSvc,
-		startPose:  startPose,
-		placePoses: placePoses,
+		client:        robotClient,
+		arm:           armDep,
+		cam:           cam,
+		gripper:       gripperDep,
+		segmenter:     segmenter,
+		motion:        motionSvc,
+		startPose:     startPose,
+		placePoses:    placePoses,
+		gripperLength: conf.GripperLength,
+		cubeHeight:    conf.CubeHeight,
 
 		status: "idle",
 	}
@@ -204,12 +223,7 @@ func (s *sorter) DoCommand(ctx context.Context, cmd map[string]interface{}) (map
 
 	case "get_detected_objects":
 		err := s.GetDetectedObjects(ctx)
-		s.mu.RLock()
-		defer s.mu.RUnlock()
-		serializedObjs := []any{}
-		for _, obj := range s.detectedObjects {
-			serializedObjs = append(serializedObjs, obj.Serialize())
-		}
+		serializedObjs := s.serializeDetectedObjects()
 		return map[string]any{"success": err == nil, "objects": serializedObjs}, err
 
 	case "pick_object":
@@ -218,11 +232,15 @@ func (s *sorter) DoCommand(ctx context.Context, cmd map[string]interface{}) (map
 			return nil, fmt.Errorf("pick_object command requires 'label' string parameter")
 		}
 		err := s.PickObject(ctx, selectedObjectLabel)
+		if err == nil {
+			s.removeDetectedObjectFromList(selectedObjectLabel)
+		}
 		return map[string]any{"success": err == nil}, err
 
 	case "get_status":
 		status, err := s.Status()
-		return map[string]any{"success": err == nil, "status": status}, err
+		serializedObjs := s.serializeDetectedObjects()
+		return map[string]any{"success": err == nil, "status": status, "detected_objects": serializedObjs}, err
 	}
 
 	return nil, fmt.Errorf("unknown command: %v", cmd)
@@ -241,6 +259,7 @@ func (s *sorter) Start() error {
 		if err != nil {
 			return err
 		}
+		s.removeDetectedObjectFromList(obj.Label)
 	}
 
 	s.mu.Lock()
@@ -253,6 +272,8 @@ func (s *sorter) Start() error {
 func (s *sorter) GetDetectedObjects(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	clear(s.detectedObjects)
 
 	s.logger.Info("Going to start position")
 	err := s.startPose.SetPosition(ctx, 2, nil)
@@ -326,29 +347,37 @@ func (s *sorter) PickObject(ctx context.Context, selectedObjectLabel string) err
 	}
 
 	objLabel := selectedObj.Geometry.Label()
+	armName := s.arm.Name().ShortName()
 
-	objVec := selectedObj.Geometry.Pose().Point()
-	s.logger.Info("Detected object at point: ", objVec)
+	objInWorld, err := s.client.TransformPointCloud(ctx, selectedObj, s.cam.Name().ShortName(), "world")
+	if err != nil {
+		return err
+	}
+	objMd := objInWorld.MetaData()
+	pickPoint := objMd.Center()
+	pickPoint.Z = objMd.MaxZ + s.gripperLength
 
-	objInCamFrame := spatialmath.NewPoseFromPoint(objVec)
-	camFramePose := referenceframe.NewPoseInFrame(s.cam.Name().ShortName(), objInCamFrame)
+	s.logger.Infof("Pick point: %v", pickPoint)
 
-	s.logger.Info("Object in camera frame: ", camFramePose.Pose().Point())
-
-	worldFramePose, err := s.client.TransformPose(ctx, camFramePose, "world", nil)
-	worldFramePoint := worldFramePose.Pose().Point()
-	s.logger.Info("Object pose in the world: ", worldFramePoint.X, worldFramePoint.Y, worldFramePoint.Z)
+	pickPoint.Z = s.cubeHeight + s.gripperLength
 
 	// set approach height
-	worldFramePoint.Z = 150
+	approachPoint := pickPoint
+	approachPoint.Z += 100
 
-	goToPose := referenceframe.NewPoseInFrame("world", spatialmath.NewPose(worldFramePoint, &spatialmath.OrientationVectorDegrees{OZ: -1, Theta: -180}))
+	currentPose, err := s.motion.GetPose(ctx, armName, "world", nil, nil)
+	movingOrientation := spatialmath.OrientationVectorDegrees{
+		OZ:    -1,
+		Theta: currentPose.Pose().Orientation().OrientationVectorDegrees().Theta,
+	}
 
-	s.logger.Infof("trying to move to %v", goToPose.Pose())
+	approachPose := referenceframe.NewPoseInFrame("world", spatialmath.NewPose(approachPoint, &movingOrientation))
+
+	s.logger.Infof("trying to move to %v", approachPose.Pose())
 
 	plan := armplanning.NewPlanState(
 		referenceframe.FrameSystemPoses{
-			s.arm.Name().ShortName(): goToPose,
+			s.arm.Name().ShortName(): approachPose,
 		},
 		referenceframe.FrameSystemInputs{},
 	)
@@ -359,14 +388,13 @@ func (s *sorter) PickObject(ctx context.Context, selectedObjectLabel string) err
 	}
 
 	// drop to pick height
-	worldFramePoint.Z = 90
-	goToPose = referenceframe.NewPoseInFrame("world", spatialmath.NewPose(worldFramePoint, &spatialmath.OrientationVectorDegrees{OZ: -1, Theta: -180}))
+	pickPose := referenceframe.NewPoseInFrame("world", spatialmath.NewPose(pickPoint, &movingOrientation))
 
 	s.status = "picking"
 
 	_, err = s.motion.Move(context.Background(), motion.MoveReq{
-		ComponentName: s.arm.Name().ShortName(),
-		Destination:   goToPose,
+		ComponentName: armName,
+		Destination:   pickPose,
 		Constraints:   &constraints,
 		Extra: map[string]any{
 			"waypoints": []any{plan.Serialize()},
@@ -374,10 +402,10 @@ func (s *sorter) PickObject(ctx context.Context, selectedObjectLabel string) err
 	})
 
 	if err != nil {
-		return nil
+		return err
 	}
 
-	time.Sleep(time.Second * 1)
+	time.Sleep(time.Millisecond * 500)
 
 	_, err = s.gripper.Grab(ctx, nil)
 	if err != nil {
@@ -387,20 +415,15 @@ func (s *sorter) PickObject(ctx context.Context, selectedObjectLabel string) err
 	time.Sleep(time.Millisecond * 250)
 
 	// raise to place movement height
-	worldFramePoint.Z = 200
-	goToPose = referenceframe.NewPoseInFrame("world", spatialmath.NewPose(worldFramePoint, &spatialmath.OrientationVectorDegrees{OZ: -1, Theta: -180}))
+	pickupPoint := pickPoint
+	pickupPoint.Z += 150
 
-	s.status = "placing"
-
-	_, err = s.motion.Move(context.Background(), motion.MoveReq{
-		ComponentName: s.arm.Name().ShortName(),
-		Destination:   goToPose,
-		Constraints:   &constraints,
-	})
-
+	err = s.arm.MoveToPosition(ctx, spatialmath.NewPose(pickupPoint, &movingOrientation), nil)
 	if err != nil {
 		return err
 	}
+
+	s.status = "placing"
 
 	placePose, ok := s.placePoses[objLabel]
 	if !ok {
@@ -412,14 +435,14 @@ func (s *sorter) PickObject(ctx context.Context, selectedObjectLabel string) err
 		return err
 	}
 
-	time.Sleep(time.Millisecond * 2000)
+	time.Sleep(time.Millisecond * 1000)
 
 	err = s.gripper.Open(ctx, nil)
 	if err != nil {
-		return nil
+		return err
 	}
 
-	time.Sleep(time.Millisecond * 500)
+	time.Sleep(time.Millisecond * 250)
 
 	s.logger.Info("Returning to start position")
 	err = s.startPose.SetPosition(ctx, 2, nil)
@@ -479,4 +502,28 @@ func (s *sorter) Close(ctx context.Context) error {
 
 	s.cancelFunc()
 	return nil
+}
+
+func (s *sorter) removeDetectedObjectFromList(selectedObjectLabel string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var objIdx int
+	for idx, obj := range s.detectedObjects {
+		if obj.Label == selectedObjectLabel {
+			objIdx = idx
+			break
+		}
+	}
+	s.detectedObjects = slices.Delete(s.detectedObjects, objIdx, objIdx+1)
+}
+
+func (s *sorter) serializeDetectedObjects() []any {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	serializedObjs := []any{}
+	for _, obj := range s.detectedObjects {
+		serializedObjs = append(serializedObjs, obj.Serialize())
+	}
+	return serializedObjs
 }

@@ -5,6 +5,7 @@ go 1.25.3
 require (
 	github.com/erh/vmodutils v0.3.2
 	go.viam.com/rdk v0.98.1
+	golang.org/x/sync v0.16.0
 )
 
 require (
@@ -200,7 +201,6 @@ require (
 	golang.org/x/mod v0.26.0 // indirect
 	golang.org/x/net v0.43.0 // indirect
 	golang.org/x/oauth2 v0.30.0 // indirect
-	golang.org/x/sync v0.16.0 // indirect
 	golang.org/x/sys v0.35.0 // indirect
 	golang.org/x/term v0.34.0 // indirect
 	golang.org/x/text v0.28.0 // indirect
