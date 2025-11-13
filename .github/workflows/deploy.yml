@@ -1,8 +1,9 @@
 # see https://github.com/viamrobotics/build-action for help
 on:
-  push:
-    tags:
-      - "[0-9]+.[0-9]+.[0-9]+" # the build-action will trigger on tags with the format 1.0.0
+  release:
+    types:
+      - released
+  workflow_dispatch:
 
 jobs:
   publish:
@@ -17,4 +18,3 @@ jobs:
           ref: ${{ github.sha }}
           key-id: ${{ secrets.viam_key_id }}
           key-value: ${{ secrets.viam_key_value }}
-          token: ${{ github.token }} # only required for private git repos
