@@ -7,8 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/sync/errgroup"
-
 	"go.viam.com/rdk/components/arm"
 	"go.viam.com/rdk/components/camera"
 	"go.viam.com/rdk/components/gripper"
@@ -24,7 +22,6 @@ import (
 	"go.viam.com/rdk/services/vision"
 	"go.viam.com/rdk/spatialmath"
 	viz "go.viam.com/rdk/vision"
-	"go.viam.com/rdk/vision/objectdetection"
 
 	"github.com/erh/vmodutils"
 )
@@ -249,12 +246,17 @@ func (s *sorter) DoCommand(ctx context.Context, cmd map[string]interface{}) (map
 func (s *sorter) Start() error {
 	ctx := s.cancelCtx
 
+	s.status = "searching_for_objects"
+
 	err := s.GetDetectedObjects(ctx)
 	if err != nil {
 		return err
 	}
 
-	for _, obj := range s.detectedObjects {
+	objects := slices.Clone(s.detectedObjects)
+	s.logger.Debugf("Detected objects: %v", objects)
+	for _, obj := range objects {
+		s.logger.Debugf("Next object: %v", obj)
 		err = s.PickObject(ctx, obj.Label)
 		if err != nil {
 			return err
@@ -283,39 +285,21 @@ func (s *sorter) GetDetectedObjects(ctx context.Context) error {
 
 	time.Sleep(time.Millisecond * 500)
 
-	g, ctx := errgroup.WithContext(ctx)
-	results := map[string]any{}
-
 	s.logger.Info("Getting objects from camera")
 
-	g.Go(func() error {
-		objs, err := s.segmenter.GetObjectPointClouds(ctx, "", nil)
-		if err != nil {
-			return err
-		}
-		results["objects"] = objs
-		return nil
-	})
-
-	g.Go(func() error {
-		dets, err := s.segmenter.DetectionsFromCamera(ctx, "", nil)
-		if err != nil {
-			return err
-		}
-		results["detections"] = dets
-		return nil
-	})
-
-	if err = g.Wait(); err != nil {
+	objs, err := s.segmenter.GetObjectPointClouds(ctx, "", nil)
+	if err != nil {
 		return err
 	}
 
-	objs := results["objects"].([]*viz.Object)
+	dets, err := s.segmenter.DetectionsFromCamera(ctx, "", nil)
+	if err != nil {
+		return err
+	}
+
 	if len(objs) == 0 {
 		return fmt.Errorf("No objects found to sort")
 	}
-
-	dets := results["detections"].([]objectdetection.Detection)
 
 	for _, obj := range objs {
 		label := obj.Geometry.Label()
@@ -334,6 +318,9 @@ func (s *sorter) GetDetectedObjects(ctx context.Context) error {
 func (s *sorter) PickObject(ctx context.Context, selectedObjectLabel string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	s.logger.Debugf("Picking object with label: %s", selectedObjectLabel)
+	s.status = "finding_object_pose"
 
 	var selectedObj *viz.Object
 	for _, obj := range s.detectedObjects {

@@ -81,6 +81,32 @@ Run through the pick and place routine: detect objects -> get pose for first obj
 }
 ```
 
+Returns:
+```json
+{
+    "success": <boolean>
+}
+```
+
+#### Get Status
+
+Query the current status of the service (idle->searching_for_objects->objects_detected->finding_object_pose->picking->placing->idle) and a list of detected objects if available.
+
+```json
+{
+  "command": "get_status"
+}
+```
+
+Returns:
+```json
+{
+    "status": <string>,
+    "detected_objects": <{"label": <string>, "box": <{"xMin": <number>, "yMin": <number>, "xMax": <number>, "yMax": <number>}>}[]>,
+    "success": <boolean>
+}
+```
+
 #### Reset
 
 Stop any current action, open the gripper, and return to start position.
@@ -88,6 +114,49 @@ Stop any current action, open the gripper, and return to start position.
 ```json
 {
   "command": "reset"
+}
+```
+
+Returns:
+```json
+{
+    "success": <boolean>
+}
+```
+
+#### Get Detected Objects
+
+Search for detected objects and get point cloud objects to store as as list of pickable items in memory.
+
+```json
+{
+  "command": "get_detected_objects"
+}
+```
+
+Returns:
+```json
+{
+    "objects": <{"label": <string>, "box": <{"xMin": <number>, "yMin": <number>, "xMax": <number>, "yMax": <number>}>}[]>,
+    "success": <boolean>
+}
+```
+
+#### Pick Object
+
+Pass a label of a pickable object to perform the "pick-n-place" routine.
+
+```json
+{
+    "command": "pick_object",
+    "label": <string>
+}
+```
+
+Returns:
+```json
+{
+    "success": <boolean>
 }
 ```
 
